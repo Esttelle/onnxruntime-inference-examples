@@ -28,7 +28,7 @@ from transformers import glue_compute_metrics as compute_metrics
 from transformers import glue_output_modes as output_modes
 from transformers import glue_processors as processors
 from transformers import glue_convert_examples_to_features as convert_examples_to_features
-import torch.ao.quantization as quantization
+from torchao.quantization import quantize_, Int8DynamicActivationInt8WeightConfig
 from datasets import load_dataset
 
 # Setup warnings
@@ -92,6 +92,20 @@ configs.eval_batch_size = 1
 configs.n_gpu = 0
 configs.local_rank = -1
 configs.overwrite_cache = False
+
+task_to_keys = {
+    "cola": ("sentence", None),
+    "mnli": ("premise", "hypothesis"),
+    "mrpc": ("sentence1", "sentence2"),
+    "qnli": ("question", "sentence"),
+    "qqp": ("question1", "question2"),
+    "rte": ("sentence1", "sentence2"),
+    "sst2": ("sentence", None),
+    "stsb": ("sentence1", "sentence2"),
+    "wnli": ("sentence1", "sentence2"),
+}
+
+sentence1_key, sentence2_key = task_to_keys[configs.task_name]
 
 # Set random seed for reproducibility.
 def set_seed(seed):
@@ -160,17 +174,9 @@ def load_training_args_robust(model_directory):
     
     raise FileNotFoundError("在模型目录中找不到可用的训练参数文件")
 
-training_args = load_training_args_robust(configs.output_dir)
+training_args = TrainingArguments(output_dir=configs.output_dir)
 
 print(training_args)
-
-
-# quantize model
-quantized_model = quantization.quantize_dynamic(
-    model, {torch.nn.Linear}, dtype=torch.qint8
-)
-
-#print(quantized_model)
 
 def print_size_of_model(model):
     torch.save(model.state_dict(), "temp.p")
@@ -178,6 +184,13 @@ def print_size_of_model(model):
     os.remove('temp.p')
 
 print_size_of_model(model)
+# quantize model
+quantize_(model, Int8DynamicActivationInt8WeightConfig())
+quantized_model = torch.compile(model)
+
+
+#print(quantized_model)
+
 print_size_of_model(quantized_model)
 
 # coding=utf-8
@@ -213,6 +226,21 @@ def evaluate_model(args, model, tokenizer):
             "glue",
             configs.task_name,
             cache_dir=configs.cache_dir
+        )
+    
+    def preprocess_function(examples):
+        # Tokenize the texts
+        args = (
+            (examples[sentence1_key],) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key])
+        )
+        result = tokenizer(*args, truncation=True)
+        return result
+
+    with training_args.main_process_first(desc="dataset map pre-processing"):
+        raw_datasets = raw_datasets.map(
+            preprocess_function,
+            batched=True,
+            desc="Running tokenizer on dataset",
         )
 
     eval_dataset = raw_datasets["validation_matched" if configs.task_name == "mnli" else "validation"]
@@ -266,7 +294,7 @@ def evaluate_model(args, model, tokenizer):
 
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     tasks = [args.task_name]
-    eval_datasets = [args.eval_dataset]
+    eval_datasets = [eval_dataset]
     if args.task_name == "mnli":
         tasks.append("mnli-mm")
         valid_mm_dataset = raw_datasets["validation_mismatched"]
@@ -276,13 +304,15 @@ def evaluate_model(args, model, tokenizer):
         eval_datasets.append(valid_mm_dataset)
         combined = {}
 
-    for eval_dataset, task in zip(eval_datasets, tasks):
-        metrics = trainer.evaluate(eval_dataset=eval_dataset)
+    for eval_data, task in zip(eval_datasets, tasks):
+        # tokenize the dataset
+        #eval_data = eval_data.map(tokenizer, batched=True)
+        metrics = trainer.evaluate(eval_dataset=eval_data)
 
         max_eval_samples = (
-            args.max_eval_samples if args.max_eval_samples is not None else len(eval_dataset)
+            args.max_eval_samples if args.max_eval_samples is not None else len(eval_data)
         )
-        metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
+        metrics["eval_samples"] = min(max_eval_samples, len(eval_data))
 
         if task == "mnli-mm":
             metrics = {k + "_mm": v for k, v in metrics.items()}
