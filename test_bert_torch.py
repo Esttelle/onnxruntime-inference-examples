@@ -22,6 +22,7 @@ from transformers import (
     TrainingArguments,
     EvalPrediction,
     default_data_collator,
+    DataCollatorWithPadding
 )
 from transformers import (BertConfig, BertForSequenceClassification, BertTokenizer,)
 from transformers import glue_compute_metrics as compute_metrics
@@ -118,62 +119,6 @@ set_seed(42)
 model = BertForSequenceClassification.from_pretrained(configs.output_dir)
 model.to(configs.device)
 
-def load_training_args_robust(model_directory):
-    """
-    鲁棒地加载训练参数
-    """
-    # 可能的文件名
-    possible_files = [
-        "training_args.bin",
-        "training_args.json", 
-        "args.json",
-        "trainer_state.json"
-    ]
-    
-    for file_name in possible_files:
-        file_path = f"{model_directory}/{file_name}"
-        try:
-            if file_name.endswith('.bin'):
-                # 加载 .bin 文件
-                content = torch.load(file_path, map_location='cpu', weights_only=False)
-                print(content)
-                print(type(content))
-                if isinstance(content, TrainingArguments):
-                    print(f"从 {file_name} 直接加载 TrainingArguments")
-                    return content
-                else:
-                    if not isinstance(content, dict):
-                        content = content.__dict__
-                    if isinstance(content, dict) or isinstance:
-                        print(f"从 {file_name} 字典转换 TrainingArguments")
-                        print(content)
-                        # 清理字典键
-                        clean_dict = {}
-                        for k, v in content.items():
-                            # 移除 torch 特定的键和私有键
-                            if not k.startswith('_') and k != 'placeholders':
-                                clean_dict[k] = v
-                        
-                        return TrainingArguments(output_dir="./temp", **clean_dict)
-            
-            elif file_name.endswith('.json'):
-                # 加载 JSON 文件
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = json.load(f)
-                
-                if file_name == "trainer_state.json" and "args" in content:
-                    print("从 trainer_state.json 加载")
-                    return TrainingArguments(output_dir="./temp", **content["args"])
-                else:
-                    print(f"从 {file_name} 加载")
-                    return TrainingArguments(output_dir="./temp", **content)
-                    
-        except Exception as e:
-            print(f"加载 {file_name} 失败: {e}")
-            continue
-    
-    raise FileNotFoundError("在模型目录中找不到可用的训练参数文件")
-
 training_args = TrainingArguments(output_dir=configs.output_dir)
 
 print(training_args)
@@ -209,18 +154,6 @@ print_size_of_model(quantized_model)
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-def compute_metrics(p: EvalPrediction):
-    preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
-    labels = p.label_ids
-    if not training_args.eval_do_concat_batches:
-        preds = np.concatenate(preds, axis=0)
-        labels = np.concatenate(p.label_ids, axis=0)
-    preds = np.squeeze(preds) if is_regression else np.argmax(preds, axis=1)
-    result = metric.compute(predictions=preds, references=labels)
-    if len(result) > 1:
-        result["combined_score"] = np.mean(list(result.values())).item()
-    return result
-
 def evaluate_model(args, model, tokenizer):
     raw_datasets = load_dataset(
             "glue",
@@ -242,6 +175,9 @@ def evaluate_model(args, model, tokenizer):
             batched=True,
             desc="Running tokenizer on dataset",
         )
+
+        
+    print(raw_datasets)
 
     eval_dataset = raw_datasets["validation_matched" if configs.task_name == "mnli" else "validation"]
     print_class_distribution(eval_dataset, "validation")
@@ -277,18 +213,28 @@ def evaluate_model(args, model, tokenizer):
     else:
         metric = evaluate.load("accuracy", cache_dir=args.cache_dir)
 
-    # training_args.batch_eval_metrics = False
-    # training_args.eval_strategy = "no"
-    # training_args.training_save_strategy == SaveStrategy.BEST
+    def compute_metrics(p: EvalPrediction):
+        preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
+        labels = p.label_ids
+        if not training_args.eval_do_concat_batches:
+            preds = np.concatenate(preds, axis=0)
+            labels = np.concatenate(p.label_ids, axis=0)
+        preds = np.squeeze(preds) if is_regression else np.argmax(preds, axis=1)
+        result = metric.compute(predictions=preds, references=labels)
+        if len(result) > 1:
+            result["combined_score"] = np.mean(list(result.values())).item()
+        return result
+
+    data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
 
     trainer = Trainer(
         model=model,
         args=training_args,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
+        eval_dataset=eval_dataset,
         train_dataset=train_dataset if training_args.do_train else None,
         compute_metrics=compute_metrics,
-        processing_class=tokenizer,
-        data_collator=default_data_collator,
+        data_collator=data_collator,
+        processing_class=tokenizer
     )
     logger.info("*** Evaluate ***")
 
