@@ -25,7 +25,7 @@ from transformers import (
     DataCollatorWithPadding
 )
 from transformers import (BertConfig, BertForSequenceClassification, BertTokenizer,)
-from transformers import glue_compute_metrics as compute_metrics
+#from transformers import glue_compute_metrics as compute_metrics
 from transformers import glue_output_modes as output_modes
 from transformers import glue_processors as processors
 from transformers import glue_convert_examples_to_features as convert_examples_to_features
@@ -54,13 +54,6 @@ logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(messa
 #    logging.WARN)  # Reduce logging
 
 print(torch.__version__)
-
-def print_class_distribution(dataset, split_name):
-    label_counts = Counter(dataset["label"])
-    total = sum(label_counts.values())
-    logger.info(f"Class distribution in {split_name} set:")
-    for label, count in label_counts.items():
-        logger.info(f"  Label {label}: {count} ({count / total:.2%})")
 
 configs = Namespace()
 
@@ -93,6 +86,7 @@ configs.eval_batch_size = 1
 configs.n_gpu = 0
 configs.local_rank = -1
 configs.overwrite_cache = False
+configs.max_eval_samples = None
 
 task_to_keys = {
     "cola": ("sentence", None),
@@ -161,13 +155,44 @@ def evaluate_model(args, model, tokenizer):
             cache_dir=configs.cache_dir
         )
     
+    padding = "max_length"
+    if args.max_seq_length > tokenizer.model_max_length:
+        logger.warning(
+            f"The max_seq_length passed ({args.max_seq_length}) is larger than the maximum length for the "
+            f"model ({tokenizer.model_max_length}). Using max_seq_length={tokenizer.model_max_length}."
+        )
+    max_seq_length = min(args.max_seq_length, tokenizer.model_max_length)
+
+
     def preprocess_function(examples):
         # Tokenize the texts
         args = (
             (examples[sentence1_key],) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key])
         )
-        result = tokenizer(*args, truncation=True)
+        result = tokenizer(*args, padding=padding, max_length=max_seq_length, truncation=True)
+
         return result
+
+    def debug_dataset(dataset):
+        """
+        调试数据集函数
+        """
+        print("=== 数据集调试信息 ===")
+        print(f"数据集类型: {type(dataset)}")
+        print(f"数据集分割: {list(dataset.keys())}")
+        
+        for split in dataset.keys():
+            print(f"\n--- {split} 分割 ---")
+            print(f"列名: {dataset[split].column_names}")
+            print(f"样本数量: {len(dataset[split])}")
+            
+            if len(dataset[split]) > 0:
+                first_item = dataset[split][0]
+                print(f"第一条数据: {first_item}")
+                print(f"第一条数据的键: {list(first_item.keys())}")
+
+    # # 调试原始数据集
+    # debug_dataset(raw_datasets)
 
     with training_args.main_process_first(desc="dataset map pre-processing"):
         raw_datasets = raw_datasets.map(
@@ -175,15 +200,31 @@ def evaluate_model(args, model, tokenizer):
             batched=True,
             desc="Running tokenizer on dataset",
         )
-
         
-    print(raw_datasets)
+    # print(raw_datasets)
+
+    # # 调试tokenized数据集
+    # debug_dataset(raw_datasets)
 
     eval_dataset = raw_datasets["validation_matched" if configs.task_name == "mnli" else "validation"]
-    print_class_distribution(eval_dataset, "validation")
 
     train_dataset = raw_datasets["train"]
-    print_class_distribution(train_dataset, "train")
+
+    # # 手动验证tokenization是否工作
+    # sample_data = train_dataset[:2]  # 取前2个样本
+    # print("原始样本:", sample_data)
+
+    # tokenized_sample = preprocess_function(sample_data)
+    # print("Tokenized样本:", tokenized_sample)
+    # print("Tokenized样本的键:", tokenized_sample.keys())
+
+    # # 检查是否包含必要的字段
+    # required_keys = ['input_ids', 'attention_mask']
+    # for key in required_keys:
+    #     if key in tokenized_sample:
+    #         print(f"✓ 包含 {key}")
+    #     else:
+    #         print(f"✗ 缺少 {key}")
 
     # Labels
     if configs.task_name is not None:
@@ -225,13 +266,14 @@ def evaluate_model(args, model, tokenizer):
             result["combined_score"] = np.mean(list(result.values())).item()
         return result
 
-    data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
+    #data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+    data_collator = default_data_collator
 
     trainer = Trainer(
         model=model,
         args=training_args,
         eval_dataset=eval_dataset,
-        train_dataset=train_dataset if training_args.do_train else None,
+        train_dataset=train_dataset,
         compute_metrics=compute_metrics,
         data_collator=data_collator,
         processing_class=tokenizer
@@ -241,6 +283,7 @@ def evaluate_model(args, model, tokenizer):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     tasks = [args.task_name]
     eval_datasets = [eval_dataset]
+    print(eval_datasets)
     if args.task_name == "mnli":
         tasks.append("mnli-mm")
         valid_mm_dataset = raw_datasets["validation_mismatched"]
@@ -253,6 +296,12 @@ def evaluate_model(args, model, tokenizer):
     for eval_data, task in zip(eval_datasets, tasks):
         # tokenize the dataset
         #eval_data = eval_data.map(tokenizer, batched=True)
+
+        eval_dataloader = trainer.get_eval_dataloader(eval_dataset=eval_data)
+        for step, inputs in enumerate(eval_dataloader):
+            print(f"Step {step}: inputs keys = {list(inputs.keys())}")
+            print(type(inputs))
+            print(inputs)
         metrics = trainer.evaluate(eval_dataset=eval_data)
 
         max_eval_samples = (
