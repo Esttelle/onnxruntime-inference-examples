@@ -32,6 +32,35 @@ from transformers import glue_convert_examples_to_features as convert_examples_t
 from torchao.quantization import quantize_, Int8DynamicActivationInt8WeightConfig
 from datasets import load_dataset
 
+# 检查量化是否成功的方法
+def check_quantization_success(model):
+    print(f"\n=== 量化状态检查 ===")
+    
+    quantized_layers = 0
+    total_layers = 0
+    
+    for name, module in model.named_modules():
+        if hasattr(module, 'weight') and module.weight is not None:
+            total_layers += 1
+            weight = module.weight
+            
+            print(f"\n{name}:")
+            print(f"  权重数据类型: {weight.dtype}")
+            print(f"  是否量化: {weight.is_quantized}")
+            
+            if weight.is_quantized:
+                quantized_layers += 1
+                print(f"  量化方案: {weight.qscheme()}")
+                print(f"  缩放因子: {weight.q_scale()}")
+                print(f"  零点: {weight.q_zero_point()}")
+            else:
+                print(f"  未量化 - 保持原始数据类型")
+    
+    print(f"\n=== 量化统计 ===")
+    print(f"总层数: {total_layers}")
+    print(f"量化层数: {quantized_layers}")
+    print(f"量化比例: {quantized_layers/total_layers*100:.1f}%")
+
 # Setup warnings
 import warnings
 warnings.filterwarnings(
@@ -46,11 +75,11 @@ warnings.filterwarnings(
 
 # Setup logging level to WARN. Change it accordingly
 logger = logging.getLogger(__name__)
-logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
-                    datefmt = '%m/%d/%Y %H:%M:%S',
-                    level = logging.WARN)
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+                    datefmt='%m/%d/%Y %H:%M:%S',
+                    level=logging.WARN)
 
-#logging.getLogger("transformers.modeling_utils").setLevel(
+# logging.getLogger("transformers.modeling_utils").setLevel(
 #    logging.WARN)  # Reduce logging
 
 print(torch.__version__)
@@ -117,36 +146,22 @@ training_args = TrainingArguments(output_dir=configs.output_dir)
 
 print(training_args)
 
+
 def print_size_of_model(model):
     torch.save(model.state_dict(), "temp.p")
     print('Size (MB):', os.path.getsize("temp.p")/(1024*1024))
     os.remove('temp.p')
 
+
 print_size_of_model(model)
 # quantize model
+# check_quantization_success(model)
+
 quantize_(model, Int8DynamicActivationInt8WeightConfig())
 quantized_model = torch.compile(model)
 
-
-#print(quantized_model)
-
 print_size_of_model(quantized_model)
 
-# coding=utf-8
-# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
-# Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 def evaluate_model(args, model, tokenizer):
     raw_datasets = load_dataset(
@@ -162,7 +177,6 @@ def evaluate_model(args, model, tokenizer):
             f"model ({tokenizer.model_max_length}). Using max_seq_length={tokenizer.model_max_length}."
         )
     max_seq_length = min(args.max_seq_length, tokenizer.model_max_length)
-
 
     def preprocess_function(examples):
         # Tokenize the texts
@@ -180,12 +194,12 @@ def evaluate_model(args, model, tokenizer):
         print("=== 数据集调试信息 ===")
         print(f"数据集类型: {type(dataset)}")
         print(f"数据集分割: {list(dataset.keys())}")
-        
+
         for split in dataset.keys():
             print(f"\n--- {split} 分割 ---")
             print(f"列名: {dataset[split].column_names}")
             print(f"样本数量: {len(dataset[split])}")
-            
+
             if len(dataset[split]) > 0:
                 first_item = dataset[split][0]
                 print(f"第一条数据: {first_item}")
@@ -298,10 +312,10 @@ def evaluate_model(args, model, tokenizer):
         #eval_data = eval_data.map(tokenizer, batched=True)
 
         eval_dataloader = trainer.get_eval_dataloader(eval_dataset=eval_data)
-        for step, inputs in enumerate(eval_dataloader):
-            print(f"Step {step}: inputs keys = {list(inputs.keys())}")
-            print(type(inputs))
-            print(inputs)
+        # for step, inputs in enumerate(eval_dataloader):
+        #     print(f"Step {step}: inputs keys = {list(inputs.keys())}")
+        #     print(type(inputs))
+        #     print(inputs)
         metrics = trainer.evaluate(eval_dataset=eval_data)
 
         max_eval_samples = (
@@ -449,6 +463,7 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
     print
     return dataset
 
+
 def time_model_evaluation(model, configs, tokenizer):
     eval_start_time = time.time()
     # result = evaluate(configs, model, tokenizer, prefix="")
@@ -458,13 +473,14 @@ def time_model_evaluation(model, configs, tokenizer):
     # print(result)
     print("Evaluate total time (seconds): {0:.1f}".format(eval_duration_time))
 
+
 # define the tokenizer
 tokenizer = BertTokenizer.from_pretrained(
     configs.output_dir, do_lower_case=configs.do_lower_case)
-    
+
 # Evaluate the original FP32 BERT model
-print('Evaluating PyTorch full precision accuracy and performance:')
-time_model_evaluation(model, configs, tokenizer)
+# print('Evaluating PyTorch full precision accuracy and performance:')
+# time_model_evaluation(model, configs, tokenizer)
 
 # Evaluate the INT8 BERT model after the dynamic quantization
 print('Evaluating PyTorch quantization accuracy and performance:')
