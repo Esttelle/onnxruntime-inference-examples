@@ -185,6 +185,9 @@ def evaluate_model(args, model, tokenizer):
         )
         result = tokenizer(*args, padding=padding, max_length=max_seq_length, truncation=True)
 
+        if "label" in examples:
+            result["label"] = examples["label"]
+
         return result
 
     def debug_dataset(dataset):
@@ -280,8 +283,7 @@ def evaluate_model(args, model, tokenizer):
             result["combined_score"] = np.mean(list(result.values())).item()
         return result
 
-    #data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
-    data_collator = default_data_collator
+    data_collator = DataCollatorWithPadding(tokenizer)
 
     trainer = Trainer(
         model=model,
@@ -311,7 +313,7 @@ def evaluate_model(args, model, tokenizer):
         # tokenize the dataset
         #eval_data = eval_data.map(tokenizer, batched=True)
 
-        eval_dataloader = trainer.get_eval_dataloader(eval_dataset=eval_data)
+        # eval_dataloader = trainer.get_eval_dataloader(eval_dataset=eval_data)
         # for step, inputs in enumerate(eval_dataloader):
         #     print(f"Step {step}: inputs keys = {list(inputs.keys())}")
         #     print(type(inputs))
