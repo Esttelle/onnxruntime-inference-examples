@@ -22,7 +22,8 @@ from transformers import (
     TrainingArguments,
     EvalPrediction,
     default_data_collator,
-    DataCollatorWithPadding
+    DataCollatorWithPadding,
+    DataCollatorForLanguageModeling
 )
 from transformers import (BertConfig, BertForSequenceClassification, BertTokenizer,)
 #from transformers import glue_compute_metrics as compute_metrics
@@ -143,6 +144,7 @@ model = BertForSequenceClassification.from_pretrained(configs.output_dir)
 model.to(configs.device)
 
 training_args = TrainingArguments(output_dir=configs.output_dir)
+training_args.label_names = ["label", 'input_ids', 'token_type_ids', 'attention_mask']
 
 print(training_args)
 
@@ -177,6 +179,7 @@ def evaluate_model(args, model, tokenizer):
             f"model ({tokenizer.model_max_length}). Using max_seq_length={tokenizer.model_max_length}."
         )
     max_seq_length = min(args.max_seq_length, tokenizer.model_max_length)
+    print(f"max_seq_length: {max_seq_length}")
 
     def preprocess_function(examples):
         # Tokenize the texts
@@ -211,21 +214,18 @@ def evaluate_model(args, model, tokenizer):
     # # 调试原始数据集
     # debug_dataset(raw_datasets)
 
-    with training_args.main_process_first(desc="dataset map pre-processing"):
-        raw_datasets = raw_datasets.map(
-            preprocess_function,
-            batched=True,
-            desc="Running tokenizer on dataset",
-        )
-        
-    # print(raw_datasets)
+    eval_dataset = raw_datasets["validation_matched" if configs.task_name == "mnli" else "validation"]
+
+    train_dataset = raw_datasets["train"]
+
+    eval_dataset = eval_dataset.map(preprocess_function, batched=True)
+
+    train_dataset = train_dataset.map(preprocess_function, batched=True)
+
 
     # # 调试tokenized数据集
     # debug_dataset(raw_datasets)
 
-    eval_dataset = raw_datasets["validation_matched" if configs.task_name == "mnli" else "validation"]
-
-    train_dataset = raw_datasets["train"]
 
     # # 手动验证tokenization是否工作
     # sample_data = train_dataset[:2]  # 取前2个样本
@@ -295,7 +295,7 @@ def evaluate_model(args, model, tokenizer):
         processing_class=tokenizer
     )
     logger.info("*** Evaluate ***")
-
+    
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     tasks = [args.task_name]
     eval_datasets = [eval_dataset]
@@ -312,6 +312,7 @@ def evaluate_model(args, model, tokenizer):
     for eval_data, task in zip(eval_datasets, tasks):
         # tokenize the dataset
         #eval_data = eval_data.map(tokenizer, batched=True)
+        print(eval_data.column_names)
 
         # eval_dataloader = trainer.get_eval_dataloader(eval_dataset=eval_data)
         # for step, inputs in enumerate(eval_dataloader):
