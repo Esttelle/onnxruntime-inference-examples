@@ -143,8 +143,10 @@ set_seed(42)
 model = BertForSequenceClassification.from_pretrained(configs.output_dir)
 model.to(configs.device)
 
-training_args = TrainingArguments(output_dir=configs.output_dir)
+#training_args = TrainingArguments(output_dir=configs.output_dir)
+training_args = BertConfig.from_pretrained(configs.output_dir)
 training_args.label_names = ["label", 'input_ids', 'token_type_ids', 'attention_mask']
+training_args.dataloader_pin_memory = False
 
 print(training_args)
 
@@ -193,26 +195,6 @@ def evaluate_model(args, model, tokenizer):
 
         return result
 
-    def debug_dataset(dataset):
-        """
-        调试数据集函数
-        """
-        print("=== 数据集调试信息 ===")
-        print(f"数据集类型: {type(dataset)}")
-        print(f"数据集分割: {list(dataset.keys())}")
-
-        for split in dataset.keys():
-            print(f"\n--- {split} 分割 ---")
-            print(f"列名: {dataset[split].column_names}")
-            print(f"样本数量: {len(dataset[split])}")
-
-            if len(dataset[split]) > 0:
-                first_item = dataset[split][0]
-                print(f"第一条数据: {first_item}")
-                print(f"第一条数据的键: {list(first_item.keys())}")
-
-    # # 调试原始数据集
-    # debug_dataset(raw_datasets)
 
     eval_dataset = raw_datasets["validation_matched" if configs.task_name == "mnli" else "validation"]
 
@@ -223,54 +205,13 @@ def evaluate_model(args, model, tokenizer):
     train_dataset = train_dataset.map(preprocess_function, batched=True)
 
 
-    # # 调试tokenized数据集
-    # debug_dataset(raw_datasets)
-
-
-    # # 手动验证tokenization是否工作
-    # sample_data = train_dataset[:2]  # 取前2个样本
-    # print("原始样本:", sample_data)
-
-    # tokenized_sample = preprocess_function(sample_data)
-    # print("Tokenized样本:", tokenized_sample)
-    # print("Tokenized样本的键:", tokenized_sample.keys())
-
-    # # 检查是否包含必要的字段
-    # required_keys = ['input_ids', 'attention_mask']
-    # for key in required_keys:
-    #     if key in tokenized_sample:
-    #         print(f"✓ 包含 {key}")
-    #     else:
-    #         print(f"✗ 缺少 {key}")
-
     # Labels
-    if configs.task_name is not None:
-        is_regression = configs.task_name == "stsb"
-        if not is_regression:
-            label_list = raw_datasets["train"].features["label"].names
-            num_labels = len(label_list)
-        else:
-            num_labels = 1
-    else:
-        # Trying to have good defaults here, don't hesitate to tweak to your needs.
-        is_regression = raw_datasets["train"].features["label"].dtype in ["float32", "float64"]
-        if is_regression:
-            num_labels = 1
-        else:
-            # A useful fast method:
-            # https://huggingface.co/docs/datasets/package_reference/main_classes#datasets.Dataset.unique
-            label_list = raw_datasets["train"].unique("label")
-            label_list.sort()  # Let's sort it for determinism
-            num_labels = len(label_list)
+    is_regression = args.task_name == "stsb"
+    label_list = raw_datasets["train"].features["label"].names
+    num_labels = len(label_list)
 
     # Get the metric function
-    if args.task_name is not None:
-        metric = evaluate.load("glue", args.task_name, cache_dir=args.cache_dir)
-    elif is_regression:
-        metric = evaluate.load("mse", cache_dir=args.cache_dir)
-    else:
-        metric = evaluate.load("accuracy", cache_dir=args.cache_dir)
-
+    metric = evaluate.load("glue", args.task_name, cache_dir=args.cache_dir)
     def compute_metrics(p: EvalPrediction):
         preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
         labels = p.label_ids
@@ -299,7 +240,6 @@ def evaluate_model(args, model, tokenizer):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     tasks = [args.task_name]
     eval_datasets = [eval_dataset]
-    print(eval_datasets)
     if args.task_name == "mnli":
         tasks.append("mnli-mm")
         valid_mm_dataset = raw_datasets["validation_mismatched"]
