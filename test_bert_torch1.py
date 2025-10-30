@@ -282,22 +282,8 @@ logger.info(f"Training/evaluation parameters {training_args}")
 # Set seed before initializing model.
 set_seed(training_args.seed)
 
-raw_datasets = load_dataset(
-    "glue",
-    data_args.task_name,
-    cache_dir=model_args.cache_dir,
-    token=model_args.token,
-)
 
-# Labels
-is_regression = data_args.task_name == "stsb"
-if not is_regression:
-    label_list = raw_datasets["train"].features["label"].names
-    num_labels = len(label_list)
-else:
-    num_labels = 1
-
-def evaluate_model(model, config, tokenizer):
+def evaluate_model(model, config, tokenizer, raw_datasets, num_labels, is_regression, label_list):
     # Preprocessing the raw_datasets
     sentence1_key, sentence2_key = task_to_keys[data_args.task_name]
 
@@ -354,13 +340,12 @@ def evaluate_model(model, config, tokenizer):
             result["label"] = [(label_to_id[l] if l != -1 else -1) for l in examples["label"]]
         return result
 
-    with training_args.main_process_first(desc="dataset map pre-processing"):
-        raw_datasets = raw_datasets.map(
-            preprocess_function,
-            batched=True,
-            load_from_cache_file=not data_args.overwrite_cache,
-            desc="Running tokenizer on dataset",
-        )
+    raw_datasets = raw_datasets.map(
+        preprocess_function,
+        batched=True,
+        load_from_cache_file=not data_args.overwrite_cache,
+        desc="Running tokenizer on dataset",
+    )
 
     def print_class_distribution(dataset, split_name):
         label_counts = Counter(dataset["label"])
@@ -464,6 +449,21 @@ def main():
     #
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
+    raw_datasets = load_dataset(
+        "glue",
+        data_args.task_name,
+        cache_dir=model_args.cache_dir,
+        token=model_args.token,
+    )
+
+    # Labels
+    is_regression = data_args.task_name == "stsb"
+    if not is_regression:
+        label_list = raw_datasets["train"].features["label"].names
+        num_labels = len(label_list)
+    else:
+        num_labels = 1
+
     config = AutoConfig.from_pretrained(
         model_args.config_name if model_args.config_name else model_args.model_name_or_path,
         num_labels=num_labels,
@@ -471,7 +471,7 @@ def main():
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         token=model_args.token,
-        trust_remote_code=model_args.trust_remote_code,
+        trust_remote_code=model_args.trust_remote_code
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
@@ -479,7 +479,7 @@ def main():
         use_fast=model_args.use_fast_tokenizer,
         revision=model_args.model_revision,
         token=model_args.token,
-        trust_remote_code=model_args.trust_remote_code,
+        trust_remote_code=model_args.trust_remote_code
     )
     model = AutoModelForSequenceClassification.from_pretrained(
         model_args.model_name_or_path,
@@ -489,10 +489,10 @@ def main():
         revision=model_args.model_revision,
         token=model_args.token,
         trust_remote_code=model_args.trust_remote_code,
-        ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
+        ignore_mismatched_sizes=model_args.ignore_mismatched_sizes
     )
 
-    evaluate_model(model, config, tokenizer)
+    evaluate_model(model, config, tokenizer, raw_datasets,  num_labels, is_regression, label_list)
 
     print_size_of_model(model)
     # quantize model
@@ -502,7 +502,7 @@ def main():
     quantized_model = torch.compile(model)
 
     print_size_of_model(quantized_model)
-    evaluate_model(quantized_model, config, tokenizer)
+    evaluate_model(quantized_model, config, tokenizer, raw_datasets,  num_labels, is_regression, label_list)
 
 
 def _mp_fn(index):
