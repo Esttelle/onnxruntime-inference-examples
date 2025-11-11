@@ -8,6 +8,9 @@ import random
 import sys
 import time
 import torch
+import evaluate
+import numpy as np
+from datasets import load_dataset
 
 from argparse import Namespace
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
@@ -58,9 +61,9 @@ configs.max_seq_length = 128
 
 # Prepare GLUE task.
 configs.task_name = "MRPC".lower()
-configs.processor = processors[configs.task_name]()
+# configs.processor = processors[configs.task_name]()
 configs.output_mode = output_modes[configs.task_name]
-configs.label_list = configs.processor.get_labels()
+# configs.label_list = configs.processor.get_labels()
 configs.model_type = "bert".lower()
 configs.do_lower_case = True
 
@@ -109,7 +112,8 @@ def export_onnx_model(args, model, tokenizer, onnx_model_path):
                     output_names=['output'],                    # the model's output names
                     dynamic_axes={'input_ids': symbolic_names,        # variable length axes
                                 'input_mask' : symbolic_names,
-                                'segment_ids' : symbolic_names})
+                                'segment_ids' : symbolic_names},
+                    dynamo=False)
         logger.info("ONNX Model exported to {0}".format(onnx_model_path))
 
 export_onnx_model(configs, model, tokenizer, "bert.onnx")
@@ -121,6 +125,8 @@ from fusion_options import FusionOptions
 # disable embedding layer norm optimization for better model size reduction
 opt_options = FusionOptions('bert')
 opt_options.enable_embed_layer_norm = False
+opt_options.intra_op_num_threads = 4
+opt_options.inter_op_num_threads = 4 
 
 opt_model = optimizer.optimize_model(
     'bert.onnx',
@@ -152,24 +158,27 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
     if args.local_rank not in [-1, 0] and not evaluate:
         torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
 
-    processor = processors[task]()
-    output_mode = output_modes[task]
-    # Load data features from cache or dataset file
+    # processor = processors[task]()
     cached_features_file = os.path.join(args.data_dir, 'cached_{}_{}_{}_{}'.format(
-        'dev' if evaluate else 'train',
+        'eval' if evaluate else 'train',
         list(filter(None, args.model_name_or_path.split('/'))).pop(),
         str(args.max_seq_length),
         str(task)))
+    raw_datasets = load_dataset("glue", task, cache_dir=cached_features_file)
+    output_mode = output_modes[task]
+    # Load data features from cache or dataset file
     if os.path.exists(cached_features_file) and not args.overwrite_cache:
         logger.info("Loading features from cached file %s", cached_features_file)
         features = torch.load(cached_features_file, weights_only=False)
     else:
         logger.info("Creating features from dataset file at %s", args.data_dir)
-        label_list = processor.get_labels()
+        # label_list = processor.get_labels()
+        label_list = raw_datasets["train"].features["label"].names
         if task in ['mnli', 'mnli-mm'] and args.model_type in ['roberta']:
             # HACK(label indices are swapped in RoBERTa pretrained model)
             label_list[1], label_list[2] = label_list[2], label_list[1]
-        examples = processor.get_dev_examples(args.data_dir) if evaluate else processor.get_train_examples(args.data_dir)
+        # examples = processor.get_dev_examples(args.data_dir) if evaluate else processor.get_train_examples(args.data_dir)
+        examples = raw_datasets["dev"] if evaluate else raw_datasets["train"]
         features = convert_examples_to_features(examples,
                                                 tokenizer,
                                                 label_list=label_list,
