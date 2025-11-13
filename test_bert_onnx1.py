@@ -1,24 +1,21 @@
 import logging
 import os
 import sys
+import time
 import torch
 from itertools import chain
-from collections import Counter
 from argparse import Namespace
 
 import evaluate
-import numpy as np
 import onnx
-from onnx import shape_inference
 import onnxruntime
 from onnxruntime.quantization import quantize_dynamic, QuantType
 from onnxruntime.transformers import optimizer
+from fusion_options import FusionOptions
 from datasets import load_dataset
+from torch.utils.data import DataLoader
 
 from transformers import (
-    EvalPrediction,
-    PretrainedConfig,
-    Trainer,
     TrainingArguments,
     default_data_collator,
     set_seed,
@@ -26,6 +23,10 @@ from transformers import (
 from transformers import (BertForSequenceClassification, BertTokenizer,)
 from transformers.utils import check_min_version
 
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.57.0")
@@ -88,7 +89,6 @@ logger.info(f"Training/evaluation parameters {training_args}")
 # Set seed before initializing model.
 set_seed(training_args.seed)
 
-
 def export_onnx(model, tokenizer, output_onnx_path):
     from transformers.onnx.features import FeaturesManager
     onnx_config = FeaturesManager._SUPPORTED_MODEL_TYPE['bert']['sequence-classification'](training_args)
@@ -100,8 +100,87 @@ def export_onnx(model, tokenizer, output_onnx_path):
         input_names=list(onnx_config.inputs.keys()),
         output_names=list(onnx_config.outputs.keys()),
         dynamic_axes={name: axes for name, axes in chain(onnx_config.inputs.items(), onnx_config.outputs.items())},
-        opset_version=17
+        opset_version=17, 
+        dynamo=False
     )
+
+def optimize_onnx(onnx_path, opt_onnx_path):
+    # disable embedding layer norm optimization for better model size reduction
+    opt_options = FusionOptions('bert')
+    opt_options.enable_embed_layer_norm = False
+    opt_options.intra_op_num_threads = 1
+    opt_options.inter_op_num_threads = 1 
+
+    optimized_model = optimizer.optimize_model(
+        onnx_path,
+        model_type='bert',
+        num_heads=12,
+        hidden_size=768,
+        optimization_options=opt_options
+    )
+    optimized_model.save_model_to_file(opt_onnx_path)
+
+
+def quantize_onnx(onnx_path, quant_onnx_path):
+    quantize_dynamic(onnx_path, 
+                     quant_onnx_path, weight_type=QuantType.QInt8, 
+                     extra_options={'DefaultTensorType': onnx.TensorProto.FLOAT})
+    
+
+def evaluate_onnx(onnx_path, tokenizer):
+    # load dataset
+    raw_datasets = load_dataset("glue", configs.task_name, cache_dir=configs.cache_dir)
+    sentence1_key, sentence2_key = task_to_keys[configs.task_name]
+
+    def preprocess_function(examples):
+        # Tokenize the texts
+        args = ((examples[sentence1_key],) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key]))
+        result = tokenizer(*args, padding='max_length', max_length=configs.max_seq_length, truncation=True)
+
+        return result
+
+    eval_dataset = raw_datasets["validation"].map(
+        preprocess_function,
+        batched=True,
+        load_from_cache_file=True,
+        desc="Running tokenizer on validation dataset",
+    )
+
+    # create onnx runtime session
+    sess_options = onnxruntime.SessionOptions()
+    sess_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+    ort_session = onnxruntime.InferenceSession(onnx_path, sess_options,  providers=['CPUExecutionProvider'])
+
+    # evaluation
+    metric = evaluate.load("glue", configs.task_name, cache_dir=configs.cache_dir)
+
+    def onnx_eval_step(batch):
+        ort_inputs = {k: v.cpu().numpy() for k, v in batch.items() if k in ['input_ids', 'attention_mask', 'token_type_ids']}
+        ort_outs = ort_session.run(None, ort_inputs)
+        return torch.tensor(ort_outs[0])
+
+    dataloader = DataLoader(
+        eval_dataset,
+        batch_size=training_args.per_device_eval_batch_size,
+        collate_fn=default_data_collator,
+        shuffle=True
+    )
+
+    for batch in dataloader:
+        logits = onnx_eval_step(batch)
+        labels = batch['labels']
+        metric.add_batch(predictions=logits.argmax(dim=-1), references=labels)
+
+    eval_metric = metric.compute()
+    print(f"ONNX model evaluation results: {eval_metric}")
+
+
+def time_ort_model_evaluation(model_path, tokenizer):
+    eval_start_time = time.time()
+    evaluate_onnx(model_path, tokenizer)
+    eval_end_time = time.time()
+    eval_duration_time = eval_end_time - eval_start_time
+    print("Evaluate total time (seconds): {0:.1f}".format(eval_duration_time))
 
 
 def main():
@@ -117,19 +196,17 @@ def main():
 
     # optimize model
     optimized_model_path = "bert_mrpc_optimized.onnx"
-    optimized_model = optimizer.optimize_model(
-        onnx_path,
-        model_type='bert',
-        num_heads=12,
-        hidden_size=768
-    )
-    optimized_model.save_model_to_file(optimized_model_path)
-    # shape_inference.infer_shapes_path(onnx_path, inferred_model_path)
-    # quantize onnx model
-    quantized_model_path = "bert_mrpc_quant.onnx"
-    quantize_dynamic(optimized_model_path, quantized_model_path, weight_type=QuantType.QInt8, extra_options={'DefaultTensorType': onnx.TensorProto.FLOAT})
+    optimize_onnx(onnx_path, optimized_model_path)
 
-    # compare origin onnx model and quantized onnx model
+    # quantize model
+    quantized_model_path = "bert_mrpc_quant.onnx"
+    quantize_onnx(optimized_model_path, quantized_model_path)
+
+    print('ONNX full precision model size (MB):', os.path.getsize(onnx_path)/(1024*1024))
+    time_ort_model_evaluation(onnx_path, tokenizer)
+
+    print('ONNX quantized model size (MB):', os.path.getsize(quantized_model_path)/(1024*1024))
+    time_ort_model_evaluation(quantized_model_path, tokenizer)
 
 
 
