@@ -9,11 +9,12 @@ from argparse import Namespace
 import evaluate
 import onnx
 import onnxruntime
-from onnxruntime.quantization import quantize_dynamic, QuantType
+from onnxruntime.quantization import quantize_dynamic, QuantType, quant_pre_process
 from onnxruntime.transformers import optimizer
 from fusion_options import FusionOptions
 from datasets import load_dataset
 from torch.utils.data import DataLoader
+from torch.export import Dim
 
 from transformers import (
     TrainingArguments,
@@ -96,34 +97,49 @@ def export_onnx(model, tokenizer, output_onnx_path):
     torch.onnx.export(model,
         (dummy_inputs,),
         f=output_onnx_path,
-        verbose=True,
         input_names=list(onnx_config.inputs.keys()),
         output_names=list(onnx_config.outputs.keys()),
         dynamic_axes={name: axes for name, axes in chain(onnx_config.inputs.items(), onnx_config.outputs.items())},
         opset_version=17, 
         dynamo=False
     )
+    input_names=list(onnx_config.inputs.keys())
+    output_names=list(onnx_config.outputs.keys())
+    # 定义动态维度
+    batch_dim = Dim("batch", min=1, max=32)  # 批量维度，最小1，最大32
+    seq_dim = Dim("seq", min=32, max=512)    # 序列维度，最小32，最大512
 
-def optimize_onnx(onnx_path, opt_onnx_path):
+    # 定义 dynamic_shapes 字典
+    dynamic_shapes = {
+        'input_ids': {0: batch_dim, 1: seq_dim},
+        'attention_mask': {0: batch_dim, 1: seq_dim},
+        'token_type_ids': {0: batch_dim, 1: seq_dim}
+    }
+    # torch.onnx.export(model,
+    #     (dummy_inputs,),
+    #     f=output_onnx_path,
+    #     input_names=input_names,
+    #     output_names=output_names,
+    #     opset_version=18, 
+    #     dynamo=True
+    # )
+
+def preprocess_onnx(onnx_path, pre_onnx_path):
     # disable embedding layer norm optimization for better model size reduction
     opt_options = FusionOptions('bert')
     opt_options.enable_embed_layer_norm = False
     opt_options.intra_op_num_threads = 1
     opt_options.inter_op_num_threads = 1 
 
-    optimized_model = optimizer.optimize_model(
-        onnx_path,
-        model_type='bert',
-        num_heads=12,
-        hidden_size=768,
-        optimization_options=opt_options
-    )
-    optimized_model.save_model_to_file(opt_onnx_path)
+    quant_pre_process(onnx_path, 
+                      pre_onnx_path, 
+                      auto_merge=True,
+                      optimization_options=opt_options)
 
 
 def quantize_onnx(onnx_path, quant_onnx_path):
     quantize_dynamic(onnx_path, 
-                     quant_onnx_path, weight_type=QuantType.QInt8, 
+                     quant_onnx_path,  
                      extra_options={'DefaultTensorType': onnx.TensorProto.FLOAT})
     
 
@@ -195,19 +211,18 @@ def main():
     export_onnx(model, tokenizer, onnx_path)
 
     # optimize model
-    optimized_model_path = "bert_mrpc_optimized.onnx"
-    optimize_onnx(onnx_path, optimized_model_path)
+    preprocessed_model_path = "bert_mrpc_optimized.onnx"
+    preprocess_onnx(onnx_path, preprocessed_model_path)
 
     # quantize model
     quantized_model_path = "bert_mrpc_quant.onnx"
-    quantize_onnx(optimized_model_path, quantized_model_path)
+    quantize_onnx(preprocessed_model_path, quantized_model_path)
 
     print('ONNX full precision model size (MB):', os.path.getsize(onnx_path)/(1024*1024))
     time_ort_model_evaluation(onnx_path, tokenizer)
 
     print('ONNX quantized model size (MB):', os.path.getsize(quantized_model_path)/(1024*1024))
     time_ort_model_evaluation(quantized_model_path, tokenizer)
-
 
 
 if __name__ == "__main__":
